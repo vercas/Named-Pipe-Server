@@ -2,8 +2,10 @@
 using System.IO;
 using System.IO.Pipes;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Named_Pipe_Server
@@ -13,11 +15,18 @@ namespace Named_Pipe_Server
         static string LogDirectory = "H:\\Logs\\Pipe";
 
         static NamedPipeServerStream srv;
+        
+        static FileStream fs;
+        static TextWriter tw;
+
         static volatile bool on = false;
         static char[] charBuffer = new char[1];
 
         static int mode = 0;
         static string PipeName = null;
+
+        static BlockingCollection<ArraySegment<byte>> Buffers = new BlockingCollection<ArraySegment<byte>>(1000);
+        static Thread Dumper = new Thread(DumpBuffers);
 
         static void Main(string[] args)
         {
@@ -81,6 +90,8 @@ namespace Named_Pipe_Server
             //  Now we do da shiz.
 
             ConstructPipe();
+
+            Dumper.Start();
 
             if (!Console.IsInputRedirected)
                 while (on)
@@ -181,6 +192,34 @@ namespace Named_Pipe_Server
                 }
 
             DestructPipe();
+
+            Dumper.Join(1000);
+
+            if (Dumper.IsAlive)
+                Dumper.Abort();
+        }
+
+        static void DumpBuffers()
+        {
+            char[] bufa = new char[1 << 16];
+
+            while (on || Buffers.Count > 0)
+            {
+                var seg = Buffers.Take();
+                
+                if (mode == 0)
+                {
+                    var str = Encoding.UTF8.GetString(seg.Array, seg.Offset, seg.Count);
+
+                    Console.Write(str);
+                    tw.Write(str);
+                }
+                else if (mode == 1)
+                {
+                    writeBytes(seg.Array, seg.Count);
+                    fs.Write(seg.Array, seg.Offset, seg.Count);
+                }
+            }
         }
 
         static void DestructPipe()
@@ -205,10 +244,7 @@ namespace Named_Pipe_Server
 
             withColor("LISTENING", writeln, ConsoleColor.Green, ConsoleColor.DarkGray);
         }
-
-        static char[] bufa = new char[1 << 16];
-        static byte[] bufb = new byte[1 << 16];
-
+        
         static void HandleClient(IAsyncResult ar)
         {
             try
@@ -226,28 +262,23 @@ namespace Named_Pipe_Server
             {
                 withColor("CONNECTED", writeln, ConsoleColor.Blue, ConsoleColor.White);
 
-                FileStream fs = File.OpenWrite(Path.Combine(LogDirectory, DateTime.Now.ToString("yyyy-MM-dd HH-mm-ss\\.\\t\\x\\t")));
-                TextWriter tw = new StreamWriter(fs, Encoding.UTF8);
+                bytesLineCursor = bytesColumnCursor = 0;
+                
+                fs = File.OpenWrite(Path.Combine(LogDirectory, DateTime.Now.ToString("yyyy-MM-dd HH-mm-ss\\.") + mode + ".txt"));
+                tw = new StreamWriter(fs, Encoding.UTF8);
 
+                byte[] bufb = new byte[1 << 16];
                 int read = -1;
 
-                if (mode == 0)
-                    using (var sr = new StreamReader(srv, Encoding.UTF8))
-                        while ((read = sr.Read(bufa, 0, bufa.Length)) > 0)
-                        {
-                            Console.Write(bufa, 0, read);
-                            tw.Write(bufa, 0, read);
-                        }
-                else if (mode == 1)
+                while ((read = srv.Read(bufb, 0, bufb.Length)) > 0)
                 {
-                    bytesLineCursor = bytesColumnCursor = 0;
+                    Buffers.Add(new ArraySegment<byte>(bufb, 0, read));
 
-                    while ((read = srv.Read(bufb, 0, bufb.Length)) > 0)
-                    {
-                        writeBytes(bufb, read);
-                        fs.Write(bufb, 0, read);
-                    }
+                    bufb = new byte[1 << 16];
                 }
+
+                while (Buffers.Count > 0) Thread.Yield();
+                //  Must not trash tw and fs until the dumper is finished.
 
                 tw.Dispose();
                 fs.Dispose();
